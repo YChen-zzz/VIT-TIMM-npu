@@ -1,13 +1,13 @@
-# ViT-B/16 · CIFAR-10 Speedrun on timm · Ascend NPU
+# ViT-B/16 · CIFAR-10 Speedrun on timm · Ascend NPU Leaderboard
 
-> This commit is the `record01_kerminal_migration` snapshot of the ViT-B/16 CIFAR-10 training speedrun built on [timm](https://github.com/huggingface/pytorch-image-models).
+> **This repository tracks NPU reproductions of a ViT-B/16 CIFAR-10 training speedrun built on [timm](https://github.com/huggingface/pytorch-image-models).**
 >
-> The task trains `vit_base_patch16_224` from scratch on CIFAR-10 at 224×224 with **4 × 910C (8 dies)**, 200 epochs, seed 42 and a global batch of 512.
+> The task trains `vit_base_patch16_224` from scratch on CIFAR-10 at 224×224 with **4 × 910C (8 dies)**, 200 epochs, seed 42 and a global batch of 512. Two implementations are recorded as separate commits: the pre-optimization `record01_kerminal_migration` and the fastest fully validated `record02_optimization` build selected from five complete optimization runs.
 >
 > The task was initially scoped as **model/operator-level optimization**, so the pre-declared quality metric is **final train loss** (`0.08390 ± 0.01`) together with **stable train time**. Eval top1 is reported for reference and is not the primary acceptance gate.
 >
-> - This commit contains the baseline training source, launcher and log.
-> - Later records are kept as separate commits; the repository README on `main` lists the full record history.
+> - The leaderboard record history below is the main result of this repository.
+> - The current tree contains the latest record, `record02_optimization`; `record01_kerminal_migration` is available at its git tag.
 > - Upstream timm code, license and attribution are preserved under `source/`.
 
 ---
@@ -43,17 +43,31 @@ The training data is not included in this repository. Set `DATA_DIR` to a CIFAR-
 DATA_DIR=/path/to/cifar10 bash run.sh
 ```
 
-The launcher does not download data, install dependencies or switch Python environments. Each run uses a unique experiment name and does not overwrite existing logs. The launcher requires all eight dies (four 910C NPUs) to be available.
+To reproduce the baseline record, check out its tag first:
 
-## Record
+```bash
+git checkout record01_kerminal_migration
+DATA_DIR=/path/to/cifar10 bash run.sh
+git checkout main
+```
 
-Times are `stable_train_time_seconds` from `train_perf.json`: 200 epochs, excluding the first warmup epoch; validation and process startup are outside this region.
+The launchers do not download data, install dependencies or switch Python environments. Each run uses a unique experiment name and does not overwrite existing logs. The launchers require all eight dies (four 910C NPUs) to be available.
 
-| Record | Time (stable train) | Final train loss | Eval top1 | Implementation | Log |
-| - | - | - | - | - | - |
-| `record01_kerminal_migration` | 1734.82 s | 0.084322795 | 84.01% | **[baseline]** original NPU port | [log](logs/record01_kerminal_migration_20261017_201347.log) |
+## NPU leaderboard record history
 
-The time above is the 2026-10-17 migration rerun. The historical validated time is 1743.26 s; migration changed it by -0.48%. The migration rerun's final train loss is 0.084322795 (historical loss +0.000414), the loss-curve mean relative error is 0.7572%, and eval top1 is 84.01% (historical 84.44%).
+Times are `stable_train_time_seconds` from `train_perf.json`: 200 epochs, excluding the first warmup epoch; validation and process startup are outside this region. Rows are sorted from longest to shortest. Each row is one complete 200-epoch run, not an average over seeds.
+
+| # | Record | Time (stable train) | Final train loss | Eval top1 | Implementation | Log |
+| - | - | - | - | - | - | - |
+| 1 | [record01_kerminal_migration](../../tree/record01_kerminal_migration) | 1734.82 s | 0.084322795 | 84.01% | **[baseline]** original NPU port | [log](logs/record01_kerminal_migration_20261017_201347.log) |
+| 2 | [record02_optimization](../../tree/record02_optimization) | **1386.06 s** | 0.083367832 | 84.22% | **[optimized]** patchify Linear, async gradient buckets, flat-gradient view, deferred loss metrics, bucket-local Adam | [log](logs/record02_optimization_20261017_201347.log) |
+
+The two records are tagged `record01_kerminal_migration` and `record02_optimization`. The times above are the 2026-10-17 migration reruns. Historical validated times are 1743.26 s (record01_kerminal_migration) and 1392.25 s (record02_optimization); migration changed them by -0.48% and -0.44%. record02_optimization is 20.10% faster than the migrated record01_kerminal_migration. For context, the complete process wall clock including validation and startup was 1889.6 s and 1539.4 s.
+
+Both records exit with code 0 and pass the pre-declared gate:
+
+- record01_kerminal_migration: final train loss 0.084322795 (historical loss +0.000414); loss-curve mean relative error 0.7572%; eval top1 84.44% → 84.01%.
+- record02_optimization: final train loss 0.083367832, identical to the historical loss; loss-curve maximum absolute error 5.96e-8; eval top1 84.22% unchanged.
 
 ## Rules
 
@@ -64,6 +78,12 @@ New records must:
 3. Report the `stable_train_time_seconds` of one complete run from `train_perf.json` (first warmup epoch excluded), and include the full log (`train_perf.json`, `summary`, exit code), the training source and a `run.sh`.
 4. Beat the prior record on the same hardware.
 
+Other than that, anything goes: NPU-specific optimisation is the point of this repository.
+
+## Submitting
+
+Open a pull request against this repository. Each submission adds its training source, a short `run.sh`, the full log, hardware and software versions, and its new leaderboard row. Do not include CIFAR-10 data, model weights, passwords, private keys or tokens.
+
 ## Upstream
 
-This project builds on [timm](https://github.com/huggingface/pytorch-image-models) and its `vit_base_patch16_224` model. The timm source and license are kept under `source/timm` and `source/TIMM_LICENSE`. All upstream credit belongs to the timm authors.
+This project builds on [timm](https://github.com/huggingface/pytorch-image-models) and its `vit_base_patch16_224` model. The timm source and license used by each record are kept under `source/timm` and `source/TIMM_LICENSE`. All upstream credit belongs to the timm authors. This repository's records are NPU training results for this task, not an official timm benchmark.

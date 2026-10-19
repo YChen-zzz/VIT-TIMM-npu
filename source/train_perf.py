@@ -28,7 +28,9 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.utils
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 import yaml
 
 from timm import utils
@@ -48,6 +50,126 @@ from timm.task import (
     resume_task_checkpoint,
     load_task_ema_checkpoint,
 )
+
+
+class PatchifyLinear(nn.Module):
+    """Conv-compatible patch projection using exact fixed-stride patchify."""
+
+    def __init__(self, conv: nn.Conv2d):
+        super().__init__()
+        assert conv.groups == 1
+        assert conv.dilation == (1, 1)
+        assert conv.padding == (0, 0)
+        assert conv.kernel_size == conv.stride
+        self.patch_size = conv.kernel_size
+        # Keep the original 4-D parameter shape and state-dict key contract.
+        self.weight = nn.Parameter(conv.weight.detach().clone())
+        self.bias = None if conv.bias is None else nn.Parameter(conv.bias.detach().clone())
+
+    def forward(self, x):
+        ph, pw = self.patch_size
+        assert x.shape[2] % ph == 0 and x.shape[3] % pw == 0
+        patches = x.reshape(
+            x.shape[0], x.shape[1], x.shape[2] // ph, ph,
+            x.shape[3] // pw, pw)
+        patches = patches.permute(0, 2, 4, 1, 3, 5).contiguous().reshape(
+            x.shape[0], -1, x.shape[1] * ph * pw)
+        tokens = F.linear(
+            patches, self.weight.reshape(self.weight.shape[0], -1), self.bias)
+        return tokens.transpose(1, 2).reshape(
+            x.shape[0], self.weight.shape[0], x.shape[2] // ph, x.shape[3] // pw)
+
+
+class AsyncGradientBuckets:
+    """Launch AVG reductions and step exact Adam buckets on the default stream."""
+
+    def __init__(self, module, optimizer, bucket_cap_mb=100):
+        assert isinstance(optimizer, torch.optim.Adam)
+        assert len(optimizer.param_groups) == 1
+        self.optimizer = optimizer
+        self.optimizer_step_in_backward = True
+        self.buckets = []
+        current, current_bytes = [], 0
+        cap_bytes = bucket_cap_mb * 1024 * 1024
+        params = [p for p in reversed(list(module.parameters())) if p.requires_grad]
+        for param in params:
+            param_bytes = param.numel() * param.element_size()
+            if current and current_bytes + param_bytes > cap_bytes:
+                self.buckets.append(current)
+                current, current_bytes = [], 0
+            current.append(param)
+            current_bytes += param_bytes
+        if current:
+            self.buckets.append(current)
+        self._bucket_index = {
+            id(param): bucket_index
+            for bucket_index, bucket in enumerate(self.buckets)
+            for param in bucket
+        }
+        self._ready = [0] * len(self.buckets)
+        self._works = []
+        self._flats = []
+        self._flat_slices = {}
+        for bucket in self.buckets:
+            total = sum(param.numel() for param in bucket)
+            flat = torch.empty(total, device=bucket[0].device, dtype=bucket[0].dtype)
+            self._flats.append(flat)
+            offset = 0
+            for param in bucket:
+                self._flat_slices[id(param)] = (len(self._flats) - 1, offset, param.numel())
+                offset += param.numel()
+        adam_keys = (
+            'lr', 'betas', 'eps', 'weight_decay', 'amsgrad', 'maximize',
+            'foreach', 'capturable', 'differentiable', 'fused')
+        adam_kwargs = {
+            key: optimizer.defaults[key] for key in adam_keys
+            if key in optimizer.defaults and optimizer.defaults[key] is not None
+        }
+        self._bucket_optimizers = [
+            torch.optim.Adam(bucket, **adam_kwargs) for bucket in self.buckets]
+        # Share the canonical state mapping so existing Adam checkpoints keep
+        # their standard parameter ordering and remain loadable.
+        for bucket_optimizer in self._bucket_optimizers:
+            bucket_optimizer.state = self.optimizer.state
+        for param in params:
+            param.register_post_accumulate_grad_hook(self._make_hook(param))
+
+    def _make_hook(self, param):
+        bucket_index = self._bucket_index[id(param)]
+
+        def hook(_param):
+            self._ready[bucket_index] += 1
+            bucket = self.buckets[bucket_index]
+            if self._ready[bucket_index] == len(bucket):
+                flat = self._flats[bucket_index]
+                for grad_param in bucket:
+                    _, offset, count = self._flat_slices[id(grad_param)]
+                    flat.narrow(0, offset, count).copy_(grad_param.grad.reshape(-1))
+                work = torch.distributed.all_reduce(
+                    flat, op=torch.distributed.ReduceOp.AVG, async_op=True)
+                self._works.append(work)
+
+        return hook
+
+    def finish(self):
+        if any(count != len(bucket) for count, bucket in zip(self._ready, self.buckets)):
+            raise RuntimeError('not all gradient buckets became ready')
+        for work in self._works:
+            work.wait()
+        with torch.no_grad():
+            for bucket_index, bucket in enumerate(self.buckets):
+                flat = self._flats[bucket_index]
+                for grad_param in bucket:
+                    _, offset, count = self._flat_slices[id(grad_param)]
+                    grad_param.grad = flat.narrow(0, offset, count).view_as(grad_param.grad)
+                bucket_optimizer = self._bucket_optimizers[bucket_index]
+                # load_state_dict replaces the canonical mapping, so refresh
+                # this alias before every step to preserve resume semantics.
+                bucket_optimizer.state = self.optimizer.state
+                bucket_optimizer.param_groups[0]['lr'] = self.optimizer.param_groups[0]['lr']
+                bucket_optimizer.step()
+        self._ready = [0] * len(self.buckets)
+        self._works.clear()
 
 
 try:
@@ -592,6 +714,11 @@ def main():
         **factory_kwargs,
         **args.model_kwargs,
     )
+    assert args.model == 'vit_base_patch16_224'
+    assert isinstance(model.patch_embed.proj, nn.Conv2d)
+    model.patch_embed.proj = PatchifyLinear(model.patch_embed.proj)
+    if utils.is_primary(args):
+        _logger.info('Using exact reshape/permute PatchifyLinear projection')
     if args.head_init_scale is not None:
         with torch.no_grad():
             model.get_classifier().weight.mul_(args.head_init_scale)
@@ -1066,12 +1193,14 @@ def main():
     # Prepare task for distributed training
     if args.distributed:
         if utils.is_primary(args):
-            _logger.info("Preparing task for distributed training (manual gradient sync, no DDP)")
+            _logger.info("Preparing task for async gradient bucket overlap")
         # Broadcast parameters from rank 0 to all ranks (avoid DDP AllGather)
         for param in model.parameters():
             torch.distributed.broadcast(param.detach(), 0)
         for buf in model.buffers():
             torch.distributed.broadcast(buf, 0)
+        task.async_gradient_buckets = AsyncGradientBuckets(
+            model, optimizer, bucket_cap_mb=100)
 
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric if loader_eval is not None else 'loss'
@@ -1376,6 +1505,7 @@ def train_one_epoch(
     update_time_m = utils.AverageMeter()
     data_time_m = utils.AverageMeter()
     losses_m = utils.AverageMeter()
+    pending_loss_metrics = []
 
     trainable_module = task.get_trainable_module()
     trainable_module.train()
@@ -1436,16 +1566,15 @@ def train_one_epoch(
                 _loss.backward(create_graph=second_order)
                 if need_update:
                     if args.distributed:
-                        for param in model.parameters():
-                            if param.grad is not None:
-                                torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.AVG)
+                        task.async_gradient_buckets.finish()
                     if args.clip_grad is not None:
                         utils.dispatch_clip_grad(
                             clip_parameters,
                             value=args.clip_grad,
                             mode=args.clip_mode,
                         )
-                    optimizer.step()
+                    if not getattr(task.async_gradient_buckets, 'optimizer_step_in_backward', False):
+                        optimizer.step()
 
         if naflex_mode:
             assert isinstance(input, dict)
@@ -1503,7 +1632,7 @@ def train_one_epoch(
                 loss, result = _forward()
                 _backward(loss)
 
-        losses_m.update(loss.item() * accum_steps, batch_size)
+        pending_loss_metrics.append((loss.detach(), accum_steps, batch_size))
         update_sample_count += global_batch_size
         epoch_sample_count += global_batch_size
 
@@ -1515,6 +1644,16 @@ def train_one_epoch(
         optimizer.zero_grad()
         task.update_ema(step=num_updates)
 
+        should_log = update_idx % args.log_interval == 0 or last_batch
+        if should_log:
+            pending_values = torch.stack([
+                entry[0] for entry in pending_loss_metrics
+            ]).float().cpu().tolist()
+            for value, (_, loss_accum_steps, loss_batch_size) in zip(
+                    pending_values, pending_loss_metrics):
+                losses_m.update(value * loss_accum_steps, loss_batch_size)
+            pending_loss_metrics.clear()
+
         if args.synchronize_step:
             if device.type == 'cuda':
                 torch.cuda.synchronize()
@@ -1525,7 +1664,7 @@ def train_one_epoch(
         update_time_m.update(time.time() - update_start_time)
         update_start_time = time_now
 
-        if update_idx % args.log_interval == 0 or last_batch:
+        if should_log:
             lrl = [param_group['lr'] for param_group in optimizer.param_groups]
             lr = sum(lrl) / len(lrl)
 

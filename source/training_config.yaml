@@ -44,7 +44,7 @@ drop_path: null
 epoch_repeats: 0.0
 epochs: 200
 eval_metric: top1
-experiment: vit_base_patch16_224_cifar10_8xnpu_20260825_231022
+experiment: vit_bucket_adam_s0_base_b100_cifar10_8xnpu_20260826_183845
 fast_norm: false
 fuser: ''
 gaussian_blur_prob: null
@@ -127,7 +127,7 @@ opt: adam
 opt_betas: null
 opt_eps: 1.0e-08
 opt_kwargs: {}
-output: output
+output: /models/share/chenyupeng/chenyupeng/Agent_training_optimization/diff_models/VIT/npu/output
 patience_epochs: 10
 persistent_workers: true
 pin_mem: true
