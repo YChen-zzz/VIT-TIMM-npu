@@ -25,7 +25,7 @@ The NPU runs use a common reference runtime with four Ascend 910C NPUs (8 dies):
 | CANN | `8.5.0` |
 | Hardware | 4 × Ascend 910C (8 dies) |
 | Process count | 8 ranks in one `torchrun` job |
-| Model | `vit_base_patch16_224`, 10 classes, from scratch |
+| Model | timm `vit_base_patch16_224` (ViT-B/16), 10 classes, randomly initialized; no pretrained weights |
 | Data | CIFAR-10, 224×224 |
 | Batch | 64 per rank, global 512 |
 | Training | 200 epochs, seed 42, BF16 AMP |
@@ -33,7 +33,7 @@ The NPU runs use a common reference runtime with four Ascend 910C NPUs (8 dies):
 | Augmentation | `rand-m14-n2`, horizontal flip 0.5 |
 | Default image | `docker.cnb.cool/nilpotenter/docker/codeserver-mindspeed:v1.0.5` |
 
-`torchrun --nproc_per_node=8` launches eight ranks (one per die) for one training job; it does not mean eight independent trainings. The `+cpu` suffix on the torch version is the Ascend package build string and does not mean the training ran on CPU.
+The model is created from the vendored timm source with `pretrained=False`; no checkpoint is downloaded. `torchrun --nproc_per_node=8` launches eight ranks (one per die) for one training job; it does not mean eight independent trainings. The `+cpu` suffix on the torch version is the Ascend package build string and does not mean the training ran on CPU.
 
 ## Running
 
@@ -42,6 +42,20 @@ The training data is not included in this repository. Set `DATA_DIR` to a CIFAR-
 ```bash
 DATA_DIR=/path/to/cifar10 bash run.sh
 ```
+
+If the dataset is not available locally, download it once with torchvision (manual setup only; the training launchers do not download data):
+
+```bash
+python - <<'PY'
+from torchvision.datasets import CIFAR10
+
+root = "/path/to/cifar10"
+CIFAR10(root, train=True, download=True)
+CIFAR10(root, train=False, download=True)
+PY
+```
+
+The resulting directory is `/path/to/cifar10/cifar-10-batches-py/`, which is what `DATA_DIR` should point to.
 
 To reproduce the baseline record, check out its tag first:
 
